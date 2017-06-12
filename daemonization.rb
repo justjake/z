@@ -198,6 +198,147 @@ module Z
     end
   end
 
+  # Here's where our complexity expands significanlty. The Framework allows you
+  # to provide just a few methods to create a fully auto-daemonized application.
+  # You can think of Framework like Zeus for your command-line apps.
+  #
+  # When you call #run, we try to connect to a running, daemonized version of your app.
+  # If no daemon is found, a new one is forked into the background, and then we connect.
+  class Framework
+    def initialize(app_name)
+      @app_name = app_name
+      @load_app_proc = nil
+      @run_app_proc = nil
+    end
+
+    def to_load_app(&block)
+      @load_app_proc = block
+      self
+    end
+
+    def to_run_app(&block)
+      @run_app_proc = block
+      self
+    end
+
+    def run
+      raise Error.new("You must call #to_load_app { ... } first") unless @load_app_proc
+      raise Error.new("You must call #to_run_app { ... } first") unless @run_run_app
+
+      # best case: the daemon is already running
+      client = new_client
+      if client
+        exit client.execute(
+          ::Dir.pwd,
+          [$0, *::ARGV],
+          ::STDIN,
+          ::STDOUT,
+          ::STDERR
+        )
+      end
+
+      # if we're still here... we need to create a server
+      File.mkdir(dir) unless File.exist?(dir)
+      logger.info("No daemon running")
+      server_is_ready, write_when_ready = ::Z::Channel.pipe
+      server_pid = fork do
+        Process.daemon
+        daemon_main(write_when_ready)
+      end
+      $stderr.puts("Started new daemon PID: #{pid}, see #{log_path} for more info.")
+      # block until the server is ready
+      server_is_ready.receive
+    end
+
+    def daemon_main(on_ready)
+      logger.info("Daemonized new process")
+
+      load_start = Time.new
+      @to_load_app.call
+      load_end = Time.new
+      logger.info("Loaded in #{load_end - load_start} seconds.")
+
+      logger.info("Starting server listening on #{socket_path}...")
+      server = ::Z::Server.new(socket_path)
+      logger.info("Ready!")
+      on_ready << "ready!"
+
+      loop do
+        handler = server.accept
+        log.info("Handling new connection #{handler}")
+        fork { handle(handler) }
+      end
+    ensure
+      server.close
+    end
+
+    def handle(handler)
+      original_context = {
+        cwd: ::Dir.pwd,
+        argv: [$0, *::ARGV],
+        stdin: $stdin.dup,
+        stdout: $stdout.dup,
+        stderr: $stderr.dup,
+      }
+
+      begin
+        context = handler.receive
+        $stdin.reopen(context[:stdin])
+        $stdout.reopen(context[:stdout])
+        $stderr.reopen(context[:stderr])
+        ::ARGV.empty
+        ::ARGV.concat(context[:argv][1..-1])
+        $0 = context[:argv].first
+        Dir.chdir(context[:cwd])
+      rescue => err
+        logger.error("Internal error: #{err.class} #{err}")
+        logger.error(err.backtrace.join("\n"))
+        handler.close_with_exit_code(130) # TODO: right exit code?
+        raise
+      end
+
+      begin
+        exit_code = @run_app_proc.call(original_context)
+        handler.close_with_exit_code(exit_code)
+        handler = nil
+      rescue => err
+        logger.error("Application error: #{err.class} #{err}")
+        logger.error(err.backtrace.join("\n"))
+        handler.close_with_exit_code(1)
+        handler = nil
+        raise
+      rescue ::SystemExit => err
+        handler.close_with_exit_code(err.status)
+        handler = nil
+      ensure
+        handler.close_with_exit_code(255) if handler
+      end
+    end
+
+    def new_client
+      ::Z::Client.new(socket_path)
+    rescue Errno::ENOENT, Errno::ECONNREFUSED
+      nil
+    end
+
+    def dir
+      @dir ||= ::File.expand_path(File.join('~', @app_name))
+    end
+
+    def socket_path
+      @socket_path ||= File.join(dir, 'control.sock')
+    end
+
+    def log_path
+      @log_path ||= File.join(dir, 'log')
+    end
+
+    def logger
+      require 'logger'
+      @logger ||= ::Logger.new(log_path)
+    end
+  end
+
   # Example command-line program that demonstrates both client and server
   class CLI
     def option_parser
@@ -221,9 +362,6 @@ EOS
 
     def run(argv)
       args = option_parser.parse(argv)
-
-      unless %w(client server).include?(args.first)
-      end
 
       unless args.size > 2
         $stderr.puts("Must specify a command and a <socket> path")
