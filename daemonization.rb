@@ -36,11 +36,11 @@ module Z
 
     def <<(message)
       if message.nil?
-        raise ArgumentError.new("Message cannot be nil")
+        raise ::ArgumentError.new("Message cannot be nil")
       end
 
-      if message.bytesize.size > 4
-        raise ArgumentErrorn.new("Message length cannot be stored in a u32")
+      unless fit_u32(message.bytesize.size)
+        raise ::ArgumentError.new("Message length cannot be stored in a u32: #{message.inspect}")
       end
 
       encoded = [message.bytesize, message].pack("NA*")
@@ -61,6 +61,13 @@ module Z
         raise Error.new("Message underflow: expected #{size} bytes, got #{message.bytesize}")
       end
       message
+    end
+
+    private
+
+    def fit_u32(before)
+      after = [before].pack("N").unpack("N").first
+      before == after
     end
   end
 
@@ -127,9 +134,15 @@ module Z
   end
 
   # Handles a single client connection on the server side.
+  #
+  # TODO: add a yielding mathod that yields a context, and then closes the
+  # context if no excpetions are raised?
+  #
+  # TODO: what if the client mysteriously dies...?
   class ServerHandler
     def initialize(channel)
       @channel = channel
+      @got_ios = []
     end
 
     def to_io
@@ -139,7 +152,7 @@ module Z
     def receive
       request = channel.receive
       unless request == EXECUTE
-        raise Error.new("Unsupported request: #{requrest.inspect}")
+        raise Error.new("Unsupported request: #{request.inspect}")
       end
       receive_execute
     end
@@ -149,11 +162,18 @@ module Z
       channel << exit_code.to_s
     end
 
+    def close_with_exit_code(exit_code)
+      send_exit_code(exit_code)
+    ensure
+      @got_ios.each(&:close)
+      @channel.to_io.close
+    end
+
     private
 
     attr_reader :channel
 
-    def read_execute
+    def receive_execute
       cwd = channel.receive
       argv = channel.receive.split("\0")
       stdin = channel.to_io.recv_io
@@ -162,6 +182,8 @@ module Z
       channel.receive
       stderr = channel.to_io.recv_io
       channel.receive
+
+      @got_ios.concat([stdin, stdout, stderr]).uniq!
 
       # return all data
       {
@@ -177,6 +199,9 @@ module Z
 
   # Server accepts incoming connections on a UNIX socket, returning
   # ServerHandler instances.
+  #
+  # TODO: if a socket at that path exists, see if it's alive. If not, remove it and start serving
+  #       if it is alive, raise an error.
   class Server
     def initialize(socket_path)
       @socket_path = socket_path
@@ -187,7 +212,13 @@ module Z
     end
 
     def accept
-      ServerHandler.new(socket.accept)
+      client = socket.accept
+      ServerHandler.new(Channel.new(client))
+    end
+
+    def close
+      socket.close
+      File.delete(@socket_path) if File.exist?(@socket_path)
     end
 
     private
@@ -222,10 +253,7 @@ EOS
     def run(argv)
       args = option_parser.parse(argv)
 
-      unless %w(client server).include?(args.first)
-      end
-
-      unless args.size > 2
+      unless args.size >= 2
         $stderr.puts("Must specify a command and a <socket> path")
         $stderr.puts(option_parser)
         exit 130
@@ -236,6 +264,9 @@ EOS
         exit(::Z::Client.execute(args[1]))
       when "server"
         exit(serve(args[1]))
+      when "pry"
+        require 'pry'
+        binding.pry
       else
         $stderr.puts("Unknown command #{args.first.inspect}")
         $stderr.puts(option_parser)
@@ -253,11 +284,14 @@ EOS
       Thread.abort_on_exception = true
 
       server = ::Z::Server.new(socket_path)
+      logger.info("Started server at path #{socket_path}")
       loop do
         handler = server.accept
         logger.info("Accepted new connection: #{handler}")
         Thread.new { handle(handler) }
       end
+    ensure
+      server.close
     end
 
     def handle(handler)
@@ -265,21 +299,26 @@ EOS
       logger.info("Received a #{context[:request]} request.")
 
       # Do some shenanigans or something
-      context[:stdout].puts context_info.inspect
+      context[:stderr].puts "hello from the server!"
+      context[:stdout].puts context.inspect
       context[:stderr].puts "Type any text, then press return: "
       some_string = context[:stdin].gets
-      context[:stdout].puts some_string.strip
+      context[:stdout].puts "You wrote: #{some_string.strip.inspect}"
       context[:stdout].puts "all done!"
 
       logger.info("Completed handling #{handler}. Returning exit code.")
 
       # just for fun, a error exit code...
-      handler.send_exit_code(76)
+      handler.close_with_exit_code(76)
+    rescue => err
+      logger.error("Error in request: #{err.class} #{err}")
+      logger.error(err.backtrace.join("\n"))
+      handler.send_exit_code(254)
     end
   end
 end
 
 # If this file was executed as a script, run our CLI.
 if __FILE__ == $0
-  ::Z::CLI.new.run
+  ::Z::CLI.new.run(ARGV)
 end
